@@ -1,17 +1,24 @@
 import * as fs from 'node:fs'
 import * as os from 'node:os'
+import * as path from 'node:path'
+import * as url from 'node:url'
 
 import delay from 'delay'
+import { TimeoutError } from 'p-timeout'
 import type { Browser, Page, Protocol, PuppeteerLaunchOptions } from 'puppeteer'
 import puppeteer from 'puppeteer-extra'
 import RecaptchaPlugin from 'puppeteer-extra-plugin-recaptcha'
 import StealthPlugin from 'puppeteer-extra-plugin-stealth'
+import random from 'random'
 
 import * as types from './types'
 
 puppeteer.use(StealthPlugin())
 
 let hasRecaptchaPlugin = false
+let hasNopechaExtension = false
+
+const __dirname = url.fileURLToPath(new URL('.', import.meta.url))
 
 /**
  * Represents everything that's required to pass into `ChatGPTAPI` in order
@@ -46,7 +53,11 @@ export async function getOpenAIAuth({
   page,
   timeoutMs = 2 * 60 * 1000,
   isGoogleLogin = false,
-  captchaToken = process.env.CAPTCHA_TOKEN
+  isMicrosoftLogin = false,
+  captchaToken = process.env.CAPTCHA_TOKEN,
+  nopechaKey = process.env.NOPECHA_KEY,
+  executablePath,
+  proxyServer = process.env.PROXY_SERVER
 }: {
   email?: string
   password?: string
@@ -54,14 +65,23 @@ export async function getOpenAIAuth({
   page?: Page
   timeoutMs?: number
   isGoogleLogin?: boolean
+  isMicrosoftLogin?: boolean
   captchaToken?: string
+  nopechaKey?: string
+  executablePath?: string
+  proxyServer?: string
 }): Promise<OpenAIAuth> {
   const origBrowser = browser
   const origPage = page
 
   try {
     if (!browser) {
-      browser = await getBrowser({ captchaToken })
+      browser = await getBrowser({
+        captchaToken,
+        nopechaKey,
+        executablePath,
+        proxyServer
+      })
     }
 
     const userAgent = await browser.userAgent()
@@ -71,15 +91,21 @@ export async function getOpenAIAuth({
     }
 
     await page.goto('https://chat.openai.com/auth/login', {
-      waitUntil: 'networkidle0'
+      waitUntil: 'networkidle2'
     })
 
     // NOTE: this is where you may encounter a CAPTCHA
-    if (hasRecaptchaPlugin) {
-      await page.solveRecaptchas()
-    }
+    await checkForChatGPTAtCapacity(page, { timeoutMs })
 
-    await checkForChatGPTAtCapacity(page)
+    if (hasRecaptchaPlugin) {
+      const captchas = await page.findRecaptchas()
+
+      if (captchas?.filtered?.length) {
+        console.log('solving captchas using 2captcha...')
+        const res = await page.solveRecaptchas()
+        console.log('captcha result', res)
+      }
+    }
 
     // once we get to this point, the Cloudflare cookies should be available
 
@@ -93,13 +119,14 @@ export async function getOpenAIAuth({
       // click login button and wait for navigation to finish
       await Promise.all([
         page.waitForNavigation({
-          waitUntil: 'networkidle0'
+          waitUntil: 'networkidle2',
+          timeout: timeoutMs
         }),
 
         page.click('#__next .btn-primary')
       ])
 
-      await checkForChatGPTAtCapacity(page)
+      await checkForChatGPTAtCapacity(page, { timeoutMs })
 
       let submitP: () => Promise<void>
 
@@ -114,19 +141,50 @@ export async function getOpenAIAuth({
         await page.waitForSelector('input[type="password"]', { visible: true })
         await page.type('input[type="password"]', password, { delay: 10 })
         submitP = () => page.keyboard.press('Enter')
+      } else if (isMicrosoftLogin) {
+        await page.click('button[data-provider="windowslive"]')
+        await page.waitForSelector('input[type="email"]')
+        await page.type('input[type="email"]', email, { delay: 10 })
+        await Promise.all([
+          page.waitForNavigation(),
+          await page.keyboard.press('Enter')
+        ])
+        await delay(1500)
+        await page.waitForSelector('input[type="password"]', { visible: true })
+        await page.type('input[type="password"]', password, { delay: 10 })
+        submitP = () => page.keyboard.press('Enter')
+        await Promise.all([
+          page.waitForNavigation(),
+          await page.keyboard.press('Enter')
+        ])
+        await delay(1000)
       } else {
         await page.waitForSelector('#username')
         await page.type('#username', email, { delay: 20 })
         await delay(100)
 
-        if (hasRecaptchaPlugin) {
-          // console.log('solveRecaptchas()')
+        // NOTE: this is where you may encounter a CAPTCHA
+        if (hasNopechaExtension) {
+          await waitForRecaptcha(page, { timeoutMs })
+        } else if (hasRecaptchaPlugin) {
+          console.log('solving captchas using 2captcha...')
           const res = await page.solveRecaptchas()
-          // console.log('solveRecaptchas result', res)
+          if (res.captchas?.length) {
+            console.log('captchas result', res)
+          } else {
+            console.log('no captchas found')
+          }
         }
 
-        await page.click('button[type="submit"]')
-        await page.waitForSelector('#password')
+        await delay(1200)
+        const frame = page.mainFrame()
+        const submit = await page.waitForSelector('button[type="submit"]', {
+          timeout: timeoutMs
+        })
+        frame.focus('button[type="submit"]')
+        await submit.focus()
+        await submit.click()
+        await page.waitForSelector('#password', { timeout: timeoutMs })
         await page.type('#password', password, { delay: 10 })
         submitP = () => page.click('button[type="submit"]')
       }
@@ -134,14 +192,15 @@ export async function getOpenAIAuth({
       await Promise.all([
         waitForConditionOrAtCapacity(page, () =>
           page.waitForNavigation({
-            waitUntil: 'networkidle0'
+            waitUntil: 'networkidle2',
+            timeout: timeoutMs
           })
         ),
         submitP()
       ])
     } else {
       await delay(2000)
-      await checkForChatGPTAtCapacity(page)
+      await checkForChatGPTAtCapacity(page, { timeoutMs })
     }
 
     const pageCookies = await page.cookies()
@@ -182,9 +241,17 @@ export async function getOpenAIAuth({
 export async function getBrowser(
   opts: PuppeteerLaunchOptions & {
     captchaToken?: string
+    nopechaKey?: string
+    proxyServer?: string
   } = {}
 ) {
-  const { captchaToken = process.env.CAPTCHA_TOKEN, ...launchOptions } = opts
+  const {
+    captchaToken = process.env.CAPTCHA_TOKEN,
+    nopechaKey = process.env.NOPECHA_KEY,
+    executablePath = defaultChromeExecutablePath(),
+    proxyServer = process.env.PROXY_SERVER,
+    ...launchOptions
+  } = opts
 
   if (captchaToken && !hasRecaptchaPlugin) {
     hasRecaptchaPlugin = true
@@ -201,19 +268,155 @@ export async function getBrowser(
     )
   }
 
-  return puppeteer.launch({
+  const puppeteerArgs = [
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-infobars',
+    '--disable-dev-shm-usage',
+    '--disable-blink-features=AutomationControlled',
+    '--ignore-certificate-errors',
+    '--no-first-run',
+    '--no-service-autorun',
+    '--password-store=basic',
+    '--system-developer-mode',
+    // the following flags all try to reduce memory
+    // '--single-process',
+    '--mute-audio',
+    '--disable-default-apps',
+    '--no-zygote',
+    '--disable-accelerated-2d-canvas',
+    '--disable-web-security',
+    '--disable-gpu'
+    // '--js-flags="--max-old-space-size=1024"'
+  ]
+
+  if (nopechaKey) {
+    const nopechaPath = path.join(
+      __dirname,
+      '..',
+      'third-party',
+      'nopecha-chrome-extension'
+    )
+    puppeteerArgs.push(`--disable-extensions-except=${nopechaPath}`)
+    puppeteerArgs.push(`--load-extension=${nopechaPath}`)
+    hasNopechaExtension = true
+  }
+
+  if (proxyServer) {
+    puppeteerArgs.push(`--proxy-server=${proxyServer}`)
+  }
+
+  const browser = await puppeteer.launch({
     headless: false,
-    args: ['--no-sandbox', '--exclude-switches', 'enable-automation'],
+    // https://peter.sh/experiments/chromium-command-line-switches/
+    args: puppeteerArgs,
+    ignoreDefaultArgs: [
+      '--disable-extensions',
+      '--enable-automation',
+      '--disable-component-extensions-with-background-pages'
+    ],
     ignoreHTTPSErrors: true,
-    executablePath: defaultChromeExecutablePath(),
+    executablePath,
     ...launchOptions
   })
+
+  if (process.env.PROXY_VALIDATE_IP) {
+    const page = (await browser.pages())[0] || (await browser.newPage())
+    // send a fetch request to https://ifconfig.co using page.evaluate() and verify the IP matches
+    let ip
+    try {
+      ;({ ip } = await page.evaluate(() => {
+        return fetch('https://ifconfig.co', {
+          headers: {
+            Accept: 'application/json'
+          }
+        }).then((res) => res.json())
+      }))
+    } catch (err) {
+      throw new Error(`Proxy IP validation failed: ${err.message}`)
+    }
+    if (ip !== process.env.PROXY_VALIDATE_IP) {
+      throw new Error(
+        `Proxy IP mismatch: ${ip} !== ${process.env.PROXY_VALIDATE_IP}`
+      )
+    }
+  }
+
+  // TOdO: this is a really hackity hack way of setting the API key...
+  if (hasNopechaExtension) {
+    const page = (await browser.pages())[0] || (await browser.newPage())
+    await page.goto(`https://nopecha.com/setup#${nopechaKey}`)
+    await delay(1000)
+    try {
+      const page3 = await browser.newPage()
+      await page.close()
+
+      // find the nopecha extension ID
+      const targets = browser.targets()
+      const extensionIds = (
+        await Promise.all(
+          targets.map(async (target) => {
+            if (target.type() !== 'service_worker') {
+              return
+            }
+
+            // const titleL = title?.toLowerCase()
+            // if (titleL?.includes('nopecha'))
+            const url = new URL(target.url())
+            return url.hostname
+          })
+        )
+      ).filter(Boolean)
+      const extensionId = extensionIds[0]
+
+      if (extensionId) {
+        const extensionUrl = `chrome-extension://${extensionId}/popup.html`
+        await page3.goto(extensionUrl, { waitUntil: 'networkidle2' })
+        await delay(500)
+
+        const editKey = await page3.waitForSelector('#edit_key .clickable')
+        await editKey.click()
+
+        const settingsInput = await page3.waitForSelector('input.settings_text')
+        // console.log('value1', await settingsInput.evaluate((el) => el.value))
+
+        await settingsInput.evaluate((el) => {
+          el.value = ''
+        })
+        await settingsInput.type(nopechaKey)
+
+        // console.log('value2', await settingsInput.evaluate((el) => el.value))
+        await settingsInput.evaluate((el, value) => {
+          el.value = value
+        }, nopechaKey)
+
+        // console.log('value3', await settingsInput.evaluate((el) => el.value))
+        await settingsInput.press('Enter')
+        await delay(500)
+        await editKey.click()
+        await delay(2000)
+        console.log('initialized nopecha extension with key', nopechaKey)
+      } else {
+        console.error(
+          "error initializing nopecha extension; couldn't determine extension ID"
+        )
+      }
+    } catch (err) {
+      console.error('error initializing nopecha extension', err)
+    }
+  }
+
+  return browser
 }
 
 /**
  * Gets the default path to chrome's executable for the current platform.
  */
 export const defaultChromeExecutablePath = (): string => {
+  if (process.env.PUPPETEER_EXECUTABLE_PATH) {
+    return process.env.PUPPETEER_EXECUTABLE_PATH
+  }
+
   switch (os.platform()) {
     case 'win32':
       return 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'
@@ -235,24 +438,52 @@ export const defaultChromeExecutablePath = (): string => {
   }
 }
 
-async function checkForChatGPTAtCapacity(page: Page) {
+async function checkForChatGPTAtCapacity(
+  page: Page,
+  opts: {
+    timeoutMs?: number
+    pollingIntervalMs?: number
+    retries?: number
+  } = {}
+) {
+  const {
+    timeoutMs = 2 * 60 * 1000, // 2 minutes
+    pollingIntervalMs = 3000,
+    retries = 10
+  } = opts
+
   // console.log('checkForChatGPTAtCapacity', page.url())
-  let res: any[]
+  let isAtCapacity = false
+  let numTries = 0
 
-  try {
-    res = await page.$x("//div[contains(., 'ChatGPT is at capacity')]")
-    // console.log('capacity1', els)
-    // if (els?.length) {
-    //   res = await Promise.all(
-    //     els.map((a) => a.evaluate((el) => el.textContent))
-    //   )
-    //   console.log('capacity2', res)
-    // }
-  } catch (err) {
-    // ignore errors likely due to navigation
-  }
+  do {
+    try {
+      await solveSimpleCaptchas(page)
 
-  if (res?.length) {
+      const res = await page.$x("//div[contains(., 'ChatGPT is at capacity')]")
+      isAtCapacity = !!res?.length
+
+      if (isAtCapacity) {
+        if (++numTries >= retries) {
+          break
+        }
+
+        // try refreshing the page if chatgpt is at capacity
+        await page.reload({
+          waitUntil: 'networkidle2',
+          timeout: timeoutMs
+        })
+
+        await delay(pollingIntervalMs)
+      }
+    } catch (err) {
+      // ignore errors likely due to navigation
+      ++numTries
+      break
+    }
+  } while (isAtCapacity)
+
+  if (isAtCapacity) {
     const error = new types.ChatGPTError('ChatGPT is at capacity')
     error.statusCode = 503
     throw error
@@ -306,4 +537,67 @@ async function waitForConditionOrAtCapacity(
 
     setTimeout(waitForCapacityText, pollingIntervalMs)
   })
+}
+
+async function solveSimpleCaptchas(page: Page) {
+  try {
+    const verifyYouAreHuman = await page.$('text=Verify you are human')
+    if (verifyYouAreHuman) {
+      await delay(2000)
+      await verifyYouAreHuman.click({
+        delay: random.int(5, 25)
+      })
+      await delay(1000)
+    }
+
+    const cloudflareButton = await page.$('.hcaptcha-box')
+    if (cloudflareButton) {
+      await delay(2000)
+      await cloudflareButton.click({
+        delay: random.int(5, 25)
+      })
+      await delay(1000)
+    }
+  } catch (err) {
+    // ignore errors
+  }
+}
+
+async function waitForRecaptcha(
+  page: Page,
+  opts: {
+    pollingIntervalMs?: number
+    timeoutMs?: number
+  } = {}
+) {
+  await solveSimpleCaptchas(page)
+
+  if (!hasNopechaExtension) {
+    return
+  }
+
+  const { pollingIntervalMs = 100, timeoutMs } = opts
+  const captcha = await page.$('textarea#g-recaptcha-response')
+  const startTime = Date.now()
+
+  if (captcha) {
+    console.log('waiting to solve recaptcha...')
+
+    do {
+      const value = (await captcha.evaluate((el) => el.value))?.trim()
+      if (value?.length) {
+        // recaptcha has been solved!
+        break
+      }
+
+      if (timeoutMs) {
+        const now = Date.now()
+        if (now - startTime >= timeoutMs) {
+          throw new TimeoutError('Timed out waiting to solve Recaptcha')
+        }
+      }
+
+      await delay(pollingIntervalMs)
+    } while (true)
+  }
 }

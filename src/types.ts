@@ -281,8 +281,7 @@ export type SendMessageOptions = {
   messageId?: string
   action?: MessageActionType
   timeoutMs?: number
-  onProgress?: (partialResponse: string) => void
-  onConversationResponse?: (response: ConversationResponseEvent) => void
+  onProgress?: (partialResponse: ChatResponse) => void
   abortSignal?: AbortSignal
 }
 
@@ -296,4 +295,16 @@ export class ChatGPTError extends Error {
   statusText?: string
   response?: Response
   originalError?: Error
+}
+
+export type ChatError = {
+  error: { message: string; statusCode?: number; statusText?: string }
+  conversationId?: string
+  messageId?: string
+}
+
+export type ChatResponse = {
+  response: string
+  conversationId: string
+  messageId: string
 }
